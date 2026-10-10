@@ -1,0 +1,294 @@
+import os
+import re
+import sys
+import threading
+import time
+import requests
+import pandas as pd
+import matplotlib.pyplot as plt
+import streamlit as st
+import uvicorn
+from fastapi import FastAPI, Depends, UploadFile, File, Form, HTTPException, APIRouter
+from pydantic import BaseModel
+from sqlalchemy import create_engine, Column, Integer, String, Text, ForeignKey, Float
+from sqlalchemy.orm import declarative_base, sessionmaker, Session, relationship
+import pdfplumber
+import PyPDF2
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+
+
+DATABASE_URL = "sqlite:///./job_tracker.db"
+engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+class User(Base):
+    __tablename__ = "users"
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, nullable=False)
+    email = Column(String, unique=True, index=True, nullable=False)
+    phone = Column(String, nullable=True)
+    github = Column(String, nullable=True)
+    linkedin = Column(String, nullable=True)
+    applications = relationship("Application", back_populates="user", cascade="all, delete-orphan")
+
+class Application(Base):
+    __tablename__ = "applications"
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"))
+    company = Column(String, nullable=False)
+    position = Column(String, nullable=False)
+    link = Column(String, nullable=True)
+    description = Column(Text, nullable=True)
+    date = Column(String, nullable=True)
+    status = Column(String, default="Başvuruldu") 
+    match_score = Column(Float, nullable=True)
+    user = relationship("User", back_populates="applications")
+
+Base.metadata.create_all(bind=engine)
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+KNOWN_SKILLS = [
+    "python", "c#", ".net", "sql", "react", "docker", "fastapi", 
+    "django", "aws", "c++", "linux", "uart", "spi", "git", "nlp"
+]
+
+def extract_text_from_pdf(pdf_file) -> str:
+    text = ""
+    try:
+        with pdfplumber.open(pdf_file) as pdf:
+            for page in pdf.pages:
+                extracted = page.extract_text()
+                if extracted:
+                    text += extracted + " "
+    except Exception:
+        pdf_file.seek(0)
+        reader = PyPDF2.PdfReader(pdf_file)
+        for page in reader.pages:
+            text += page.extract_text() or ""
+    return text
+
+def parse_cv_skills(pdf_file) -> list[str]:
+    raw_text = extract_text_from_pdf(pdf_file).lower()
+    found_skills = set()
+    for skill in KNOWN_SKILLS:
+        pattern = r'\b' + re.escape(skill) + r'\b'
+        if re.search(pattern, raw_text):
+            found_skills.add(skill)
+    return list(found_skills)
+
+def calculate_match_tfidf(cv_skills: list[str], job_skills: list[str]) -> dict:
+    if not job_skills:
+        return {"match_percentage": 0.0, "missing_skills": []}
+    
+    cv_str = " ".join(cv_skills)
+    job_str = " ".join(job_skills)
+    
+    vectorizer = TfidfVectorizer()
+    try:
+        tfidf_matrix = vectorizer.fit_transform([cv_str, job_str])
+        sim = cosine_similarity(tfidf_matrix[0:1], tfidf_matrix[1:2])[0][0]
+    except Exception:
+        sim = 0.0
+        
+    missing = [skill for skill in job_skills if skill.lower() not in [s.lower() for s in cv_skills]]
+    return {
+        "match_percentage": round(sim * 100, 2),
+        "missing_skills": missing
+    }
+
+api_app = FastAPI(title="AI Job Application Tracker API")
+
+class UserCreate(BaseModel):
+    name: str
+    email: str
+    phone: str | None = None
+    github: str | None = None
+    linkedin: str | None = None
+
+class ApplicationCreate(BaseModel):
+    user_id: int
+    company: str
+    position: str
+    link: str | None = None
+    description: str | None = None
+    date: str | None = None
+    status: str = "Başvuruldu"
+
+@api_app.post("/users")
+def create_user(user: UserCreate, db: Session = Depends(get_db)):
+    db_user = User(**user.dict())
+    db.add(db_user)
+    db.commit()
+    db.refresh(db_user)
+    return db_user
+
+@api_app.get("/users/{user_id}")
+def get_user(user_id: int, db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="Kullanıcı bulunamadı")
+    return user
+
+@api_app.post("/applications")
+def create_application(app_data: ApplicationCreate, db: Session = Depends(get_db)):
+    new_app = Application(**app_data.dict())
+    db.add(new_app)
+    db.commit()
+    db.refresh(new_app)
+    return new_app
+
+@api_app.get("/applications")
+def get_applications(db: Session = Depends(get_db)):
+    return db.query(Application).all()
+
+@api_app.put("/applications/{app_id}")
+def update_application(app_id: int, status: str, db: Session = Depends(get_db)):
+    app = db.query(Application).filter(Application.id == app_id).first()
+    if not app:
+        raise HTTPException(status_code=404, detail="Başvuru bulunamadı")
+    app.status = status
+    db.commit()
+    return app
+
+@api_app.delete("/applications/{app_id}")
+def delete_application(app_id: int, db: Session = Depends(get_db)):
+    app = db.query(Application).filter(Application.id == app_id).first()
+    if not app:
+        raise HTTPException(status_code=404, detail="Başvuru bulunamadı")
+    db.delete(app)
+    db.commit()
+    return {"message": "Başvuru silindi"}
+
+@api_app.post("/analyze-cv")
+async def analyze_cv(file: UploadFile = File(...), job_requirements: str = Form("")):
+    cv_skills = parse_cv_skills(file.file)
+    req_skills = [s.strip().lower() for s in job_requirements.split(",") if s.strip()]
+    match_result = calculate_match_tfidf(cv_skills, req_skills)
+    return {
+        "extracted_cv_skills": cv_skills,
+        "match_analysis": match_result
+    }
+
+def run_fastapi():
+    uvicorn.run(api_app, host="127.0.0.1", port=8000, log_level="error")
+
+def start_backend_thread():
+    thread = threading.Thread(target=run_fastapi, daemon=True)
+    thread.start()
+
+API_URL = "http://127.0.0.1:8000"
+
+def main_ui():
+    st.set_page_config(page_title="AI Job Application Tracker", layout="wide")
+    st.title("🚀 AI Destekli İş Başvuru Takip ve CV Analiz Sistemi")
+
+    menu = st.sidebar.selectbox("Menü", ["Dashboard", "Kullanıcı Profili", "Başvuru Ekle", "CV / İlan Eşleştirme"])
+
+    if menu == "Dashboard":
+        st.header("📌 Başvuru İstatistikleri")
+        try:
+            res = requests.get(f"{API_URL}/applications")
+            if res.status_code == 200:
+                apps = res.json()
+                df = pd.DataFrame(apps)
+                
+                if not df.empty:
+                    col1, col2, col3, col4 = st.columns(4)
+                    col1.metric("Toplam Başvuru", len(df))
+                    col2.metric("Mülakat", len(df[df['status'] == 'Interview']))
+                    col3.metric("Teklif", len(df[df['status'] == 'Offer']))
+                    col4.metric("Red", len(df[df['status'] == 'Rejected']))
+                    
+                    st.divider()
+                    st.subheader("📊 Şirket Bazlı Başvuru Dağılımı")
+                    company_counts = df['company'].value_counts()
+                    
+                    fig, ax = plt.subplots(figsize=(8, 3))
+                    company_counts.plot(kind='barh', ax=ax, color='skyblue')
+                    ax.set_xlabel("Başvuru Sayısı")
+                    st.pyplot(fig)
+                    
+                    st.subheader("📋 Tüm Başvurular")
+                    st.dataframe(df[['id', 'company', 'position', 'status', 'date', 'link']])
+                else:
+                    st.info("Henüz kayıtlı başvuru yok.")
+        except Exception as e:
+            st.error(f"Backend servisi henüz hazır değil veya bir hata oluştu: {e}")
+
+    elif menu == "Kullanıcı Profili":
+        st.header("👤 Kullanıcı Profili Oluştur / Yönet")
+        with st.form("user_form"):
+            name = st.text_input("Ad Soyad")
+            email = st.text_input("E-Posta")
+            phone = st.text_input("Telefon")
+            github = st.text_input("GitHub")
+            linkedin = st.text_input("LinkedIn")
+            
+            submit_user = st.form_submit_button("Kullanıcıyı Kaydet")
+            if submit_user:
+                payload = {"name": name, "email": email, "phone": phone, "github": github, "linkedin": linkedin}
+                r = requests.post(f"{API_URL}/users", json=payload)
+                if r.status_code == 200:
+                    st.success("Kullanıcı başarıyla kaydedildi!")
+                else:
+                    st.error("Kullanıcı oluşturulurken bir hata oluştu.")
+
+    elif menu == "Başvuru Ekle":
+        st.header("➕ Yeni İş İlanı Ekle")
+        with st.form("job_form"):
+            user_id = st.number_input("Kullanıcı ID", value=1, step=1)
+            company = st.text_input("Firma", value="ASELSAN")
+            position = st.text_input("Pozisyon", value="Embedded Software Engineer")
+            link = st.text_input("Link")
+            description = st.text_area("Açıklama / Yetenekler", value="C++, Linux, UART, SPI, Docker")
+            date = st.text_input("Tarih", value="2026-10-10")
+            status = st.selectbox("Durum", ["Başvuruldu", "Interview", "Offer", "Rejected"])
+            
+            submitted = st.form_submit_button("Başvuruyu Kaydet")
+            if submitted:
+                payload = {
+                    "user_id": user_id, "company": company, "position": position,
+                    "link": link, "description": description, "date": date, "status": status
+                }
+                r = requests.post(f"{API_URL}/applications", json=payload)
+                if r.status_code == 200:
+                    st.success("Başvuru başarıyla eklendi!")
+                else:
+                    st.error("Başvuru eklenemedi.")
+
+    elif menu == "CV / İlan Eşleştirme":
+        st.header("🎯 CV - İlan Eşleştirme Analizi")
+        
+        uploaded_file = st.file_uploader("CV Yükle (PDF)", type=["pdf"])
+        job_reqs = st.text_input("İlan Gereksinimleri (Virgülle ayırın)", "Python, FastAPI, SQL, Docker")
+        
+        if st.button("Analiz Et"):
+            if uploaded_file and job_reqs:
+                files = {"file": (uploaded_file.name, uploaded_file.getvalue(), "application/pdf")}
+                data = {"job_requirements": job_reqs}
+                
+                res = requests.post(f"{API_URL}/analyze-cv", files=files, data=data)
+                if res.status_code == 200:
+                    result = res.json()
+                    st.subheader("📋 Analiz Sonuçları")
+                    st.write("*CV'den Çıkarılan Yetenekler:*", ", ".join(result["extracted_cv_skills"]) if result["extracted_cv_skills"] else "Hiçbiri")
+                    
+                    analysis = result["match_analysis"]
+                    st.metric("Uyumluluk Skoru", f"%{analysis['match_percentage']}")
+                    
+                    if analysis["missing_skills"]:
+                        st.warning(f"*Eksik Yetenekler:* {', '.join(analysis['missing_skills'])}")
+                    else:
+                        st.success("İlan için gerekli tüm yetenekler CV'nizde mevcut!")
+
+if __name__ == "__main__":
+    start_backend_thread()
+    time.sleep(1)  
